@@ -103,3 +103,53 @@ You can use `Cu2H8C28N6O8` and `example/case.txt` as input example.
 The output will be saved in `<save_path>` dir and you can also download it from gradio web UI. The GT cif file can be found in `example/case_gt.cif`.
 
 For the V100 GPU, it takes nearly 20 seconds to generate a sample.
+
+---
+
+## Retrieval-Augmented Generation (RAG) Extension
+
+This repository includes an extension for **Retrieval-Augmented Generation** (RAG) to improve crystal structure prediction quality.
+
+### Stage 1: Retrieval System
+
+Build retrieval index from training data:
+```bash
+python scripts/build_retrieval_index.py \
+    --cpcp_ckpt ckpt/hmof_100/CPCP/hmof_100_cpcp.ckpt \
+    --data_path data/hmof_100/train.lmdb \
+    --output_dir retrieval_indices/hmof_100
+```
+
+Test retrieval quality:
+```bash
+python scripts/test_retrieval.py --index_path retrieval_indices/hmof_100
+```
+
+For SLURM cluster usage, see `scripts/slurm/` directory.
+
+### Retrieval System Performance
+
+- **Recall@1**: 94%
+- **Recall@10**: 97%
+- **Query Speed**: 0.7ms (GPU), 8.5ms (CPU)
+- **Index Size**: 372MB for 73K structures
+
+See `retrieval_experiments/README.md` for detailed analysis.
+
+---
+
+## Project Structure
+
+```
+XtalNet/
+├── xtalnet/              # Core code
+│   ├── pl_modules/       # Model definitions
+│   ├── pl_data/          # Data loading
+│   ├── common/           # Utilities
+│   └── retrieval/        # RAG retrieval system
+├── scripts/              # Evaluation and utility scripts
+│   └── slurm/            # SLURM job scripts
+├── conf/                 # Hydra configurations
+├── example/              # Example files
+└── retrieval_experiments/ # Retrieval analysis tools
+```

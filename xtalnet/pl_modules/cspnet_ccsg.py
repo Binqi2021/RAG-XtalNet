@@ -12,6 +12,39 @@ from xtalnet.common.data_utils import lattice_params_to_matrix_torch, get_pbc_di
 
 MAX_ATOMIC_NUM=100
 
+
+class TemplateGate(nn.Module):
+    """
+    Lightweight gating module for RAG-enhanced generation.
+    
+    Computes a gate value based on current global features and retrieved template embeddings.
+    The gate is used to modulate the coordinate noise prediction, allowing the model to
+    selectively incorporate information from retrieved similar structures.
+    
+    Args:
+        hidden_dim: Dimension of hidden features
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+    
+    def forward(self, global_feat, template_emb):
+        """
+        Args:
+            global_feat: [B, d] - Global features from current node representations
+            template_emb: [B, d] - Aggregated template embeddings from retrieval
+        
+        Returns:
+            gate: [B, 1] - Gate values in range [0, 1]
+        """
+        x = torch.cat([global_feat, template_emb], dim=-1)
+        gate = torch.sigmoid(self.fc(x))  # [B, 1]
+        return gate
+
 class SinusoidsEmbedding(nn.Module):
     def __init__(self, n_frequencies = 10, n_space = 3):
         super().__init__()
@@ -112,12 +145,15 @@ class CSPPXRDNet(nn.Module):
         ip = True,
         smooth = False,
         pred_type = False,
-        out_node = False
+        out_node = False,
+        use_rag_gate = False  # RAG: Enable template gating
     ):
         super(CSPPXRDNet, self).__init__()
 
         self.ip = ip
         self.smooth = smooth
+        self.use_rag_gate = use_rag_gate  # RAG: Store flag
+        
         if self.smooth:
             self.node_embedding = nn.Linear(max_atoms, hidden_dim)
         else:
@@ -147,6 +183,10 @@ class CSPPXRDNet(nn.Module):
             self.type_out = nn.Linear(hidden_dim, MAX_ATOMIC_NUM)
         if out_node:
             self.out_node = nn.Linear(hidden_dim, hidden_dim, bias = False)
+        
+        # RAG: Initialize template gate if enabled
+        if self.use_rag_gate:
+            self.template_gate = TemplateGate(latent_dim)  # latent_dim matches pxrd_feat dimension
 
     def select_symmetric_edges(self, tensor, mask, reorder_idx, inverse_neg):
         # Mask out counter-edges
@@ -259,7 +299,25 @@ class CSPPXRDNet(nn.Module):
             return edge_index_new, -edge_vector_new
             
 
-    def forward(self, t, atom_types, frac_coords, lattices, num_atoms, node2graph, pxrd_feat):
+    def forward(self, t, atom_types, frac_coords, lattices, num_atoms, node2graph, pxrd_feat, template_emb=None, return_hidden=False):
+        """
+        Forward pass with optional RAG template embedding and hidden states.
+        
+        Args:
+            t: Time embedding
+            atom_types: Atomic numbers
+            frac_coords: Fractional coordinates
+            lattices: Lattice matrices
+            num_atoms: Number of atoms per structure
+            node2graph: Node to graph mapping
+            pxrd_feat: PXRD features
+            template_emb: [B, d] Optional template embeddings from retrieval (RAG)
+            return_hidden: If True, return hidden states for alignment loss (training only)
+        
+        Returns:
+            If return_hidden=False: (lattice_out, coord_out)
+            If return_hidden=True: (lattice_out, coord_out, hidden_list)
+        """
 
         edges, frac_diff = self.gen_edges(num_atoms, frac_coords, lattices, node2graph)
         edge2graph = node2graph[edges[0]]
@@ -276,27 +334,57 @@ class CSPPXRDNet(nn.Module):
             node_features = torch.cat([node_features, t_per_atom, pxrd_per_atom], dim=1)
             node_features = self.atom_latent_emb(node_features)
 
+        # ALIGNMENT: Collect hidden states for alignment loss
+        hidden_list = []
+        
         for i in range(0, self.num_layers):
             node_features = self._modules["csp_layer_%d" % i](node_features, frac_coords, lattices, edges, edge2graph, frac_diff = frac_diff)
+            
+            # ALIGNMENT: Store intermediate hidden states (every 2 layers)
+            if return_hidden and i % 2 == 1:
+                # Global pool node features to get graph-level representation
+                graph_hidden = scatter(node_features, node2graph, dim=0, reduce='mean')  # [B, hidden_dim]
+                hidden_list.append(graph_hidden)
 
         if self.ln:
             node_features = self.final_layer_norm(node_features)
 
         graph_features = scatter(node_features, node2graph, dim = 0, reduce = 'mean')
         
+        # ALIGNMENT: Always include final graph features if return_hidden
+        if return_hidden:
+            hidden_list.append(graph_features)
+        
         if t is None:
             final_feat = self.out_node(graph_features)
+            if return_hidden:
+                return final_feat, hidden_list
             return final_feat
         else:
             coord_out = self.coord_out(node_features)
+            
+            # RAG: Apply template gating to coordinate output if template_emb is provided
+            if self.use_rag_gate and template_emb is not None:
+                # Compute gate based on global features and template embeddings
+                gate = self.template_gate(graph_features, template_emb)  # [B, 1]
+                # Expand gate to per-atom dimension
+                gate_per_atom = gate.repeat_interleave(num_atoms, dim=0)  # [N_atoms, 1]
+                # Apply gating: modulate coordinate output
+                # This allows the model to selectively use template information
+                coord_out = coord_out + gate_per_atom * coord_out  # Residual gating
+            
             lattice_out = self.lattice_out(graph_features)
             lattice_out = lattice_out.view(-1, 3, 3)
             if self.ip:
                 lattice_out = torch.einsum('bij,bjk->bik', lattice_out, lattices)
             if self.pred_type:
                 type_out = self.type_out(node_features)
+                if return_hidden:
+                    return lattice_out, coord_out, type_out, hidden_list
                 return lattice_out, coord_out, type_out
 
+            if return_hidden:
+                return lattice_out, coord_out, hidden_list
             return lattice_out, coord_out
 
 class CSPPXRDAddNet(nn.Module):

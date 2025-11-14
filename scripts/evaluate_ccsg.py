@@ -35,6 +35,9 @@ def diffusion(
     begin_idx=0,
     end_idx=-1,
     step_lr=1e-5,
+    retriever=None,  # RAG: Optional retriever
+    rag_top_m=4,  # RAG: Number of templates
+    rag_strength=1.0,  # RAG: Gating strength
 ):
     frac_coords = []
     num_atoms = []
@@ -57,7 +60,14 @@ def diffusion(
         input_data_list = input_data_list + batch.to_data_list()
         for eval_idx in range(num_evals):
             print(f"batch {idx} / {len(loader)}, sample {eval_idx} / {num_evals}")
-            outputs, _ = ccsg_model.sample(batch, step_lr=step_lr)
+            # RAG: Pass retriever and RAG parameters to sample
+            outputs, _ = ccsg_model.sample(
+                batch, 
+                step_lr=step_lr,
+                retriever=retriever,
+                rag_top_m=rag_top_m,
+                rag_strength=rag_strength
+            )
             batch_frac_coords.append(outputs["frac_coords"].detach().cpu())
             batch_num_atoms.append(outputs["num_atoms"].detach().cpu())
             batch_atom_types.append(outputs["atom_types"].detach().cpu())
@@ -119,6 +129,29 @@ def main(args):
         ccsg_model.to("cuda")
         cpcp_model.to("cuda")
 
+    # RAG: Initialize retriever if database path is provided
+    retriever = None
+    if args.retrieval_db_npz:
+        print(f"\n{'='*60}")
+        print("RAG MODE ENABLED")
+        print(f"{'='*60}")
+        print(f"Database: {args.retrieval_db_npz}")
+        print(f"Index: {args.retrieval_index}")
+        print(f"Top-M: {args.rag_top_m}")
+        print(f"Strength: {args.rag_strength}")
+        print(f"{'='*60}\n")
+        
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from xtalnet.retrieval import PXRDTemplateRetriever
+        
+        retriever = PXRDTemplateRetriever(
+            db_npz_path=args.retrieval_db_npz,
+            faiss_index_path=args.retrieval_index,
+            normalize=True
+        )
+        print(f"Retriever initialized: {retriever.n_samples} samples\n")
+
     print("Evaluate the ccsg model.")
 
     start_time = time.time()
@@ -130,6 +163,9 @@ def main(args):
         step_lr=args.step_lr,
         begin_idx=args.begin_idx,
         end_idx=args.end_idx,
+        retriever=retriever,  # RAG: Pass retriever
+        rag_top_m=args.rag_top_m,  # RAG: Pass top_m
+        rag_strength=args.rag_strength,  # RAG: Pass strength
     )
 
     ccsg_out_name = f"eval_ccsg_{args.label}_number-eval{args.num_evals}_b{args.begin_idx}_e{args.end_idx}.pt"
@@ -163,5 +199,16 @@ if __name__ == "__main__":
     parser.add_argument("--label", default="")
     parser.add_argument("--begin_idx", default=0, type=int)
     parser.add_argument("--end_idx", default=-1, type=int)
+    
+    # RAG: New arguments for retrieval-augmented generation
+    parser.add_argument("--retrieval_db_npz", default="", type=str,
+                       help="Path to retrieval database NPZ file (enables RAG if provided)")
+    parser.add_argument("--retrieval_index", default="", type=str,
+                       help="Path to FAISS index file")
+    parser.add_argument("--rag_top_m", default=4, type=int,
+                       help="Number of templates to retrieve for RAG")
+    parser.add_argument("--rag_strength", default=1.0, type=float,
+                       help="Strength of RAG gating (multiplier for gate effect)")
+    
     args = parser.parse_args()
     main(args)

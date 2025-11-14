@@ -108,6 +108,35 @@ class CSPDiffusion(BaseModule):
         
         self.decoder = hydra.utils.instantiate(self.hparams.crystal_encoder, latent_dim = self.hparams.latent_dim + self.hparams.time_dim, _recursive_=False)
         
+        # ALIGNMENT: Initialize CPCP model for alignment loss (optional)
+        self.cpcp_model = None
+        self.use_alignment_loss = getattr(self.hparams, 'use_alignment_loss', False)
+        self.alignment_lambda = getattr(self.hparams, 'alignment_lambda', 0.1)
+        self.alignment_temperature = getattr(self.hparams, 'alignment_temperature', 0.1)
+        self.alignment_start_epoch = getattr(self.hparams, 'alignment_start_epoch', 0)
+        
+        if self.use_alignment_loss:
+            cpcp_ckpt_path = getattr(self.hparams, 'cpcp_ckpt_path', None)
+            if cpcp_ckpt_path:
+                print(f'\n{"="*60}')
+                print('ALIGNMENT LOSS ENABLED')
+                print(f'{"="*60}')
+                print(f'CPCP checkpoint: {cpcp_ckpt_path}')
+                print(f'Lambda: {self.alignment_lambda}')
+                print(f'Temperature: {self.alignment_temperature}')
+                print(f'Start epoch: {self.alignment_start_epoch}')
+                print(f'{"="*60}\n')
+                
+                # Load CPCP model
+                from xtalnet.pl_modules.cpcp_module import CPCPModule
+                self.cpcp_model = CPCPModule.load_from_checkpoint(cpcp_ckpt_path, strict=False)
+                self.cpcp_model.eval()
+                self.cpcp_model.requires_grad_(False)
+                print('CPCP model loaded and frozen for alignment loss')
+            else:
+                print('WARNING: use_alignment_loss=True but cpcp_ckpt_path not provided. Alignment loss disabled.')
+                self.use_alignment_loss = False
+        
         
 
 
@@ -137,7 +166,7 @@ class CSPDiffusion(BaseModule):
         results['pxrd_feat'] = pxrd_feat
         return results
 
-    def forward(self, batch):
+    def forward(self, batch, return_hidden=False):
         
         cpcp_results = self.pxrd_forward(batch)
         pxrd_cls = cpcp_results['pxrd_feat']
@@ -172,7 +201,14 @@ class CSPDiffusion(BaseModule):
         if self.keep_lattice:
             input_lattice = lattices
 
-        pred_l, pred_x = self.decoder(time_emb, batch.atom_types, input_frac_coords, input_lattice, batch.num_atoms, batch.batch, pxrd_cls)
+        # Training: no RAG, template_emb=None, optionally return hidden states
+        decoder_output = self.decoder(time_emb, batch.atom_types, input_frac_coords, input_lattice, batch.num_atoms, batch.batch, pxrd_cls, template_emb=None, return_hidden=return_hidden)
+        
+        if return_hidden:
+            pred_l, pred_x, hidden_list = decoder_output
+        else:
+            pred_l, pred_x = decoder_output
+            hidden_list = None
 
         tar_x = d_log_p_wrapped_normal(sigmas_per_atom * rand_x, sigmas_per_atom) / torch.sqrt(sigmas_norm_per_atom)
 
@@ -189,10 +225,27 @@ class CSPDiffusion(BaseModule):
             'loss_lattice' : loss_lattice,
             'loss_coord' : loss_coord,
         }
+        
+        if return_hidden:
+            loss_dict['hidden_list'] = hidden_list
+        
         return loss_dict
 
     @torch.no_grad()
-    def sample(self, batch, step_lr = 1e-5):
+    def sample(self, batch, step_lr = 1e-5, retriever=None, rag_top_m=4, rag_strength=1.0):
+        """
+        Sample crystal structures with optional RAG enhancement.
+        
+        Args:
+            batch: Input batch
+            step_lr: Step size for Langevin dynamics
+            retriever: Optional PXRDTemplateRetriever for RAG
+            rag_top_m: Number of templates to retrieve
+            rag_strength: Strength of RAG gating (multiplier for gate effect)
+        
+        Returns:
+            Final structure and trajectory
+        """
 
         batch_size = batch.num_graphs
 
@@ -214,6 +267,26 @@ class CSPDiffusion(BaseModule):
         }}
 
         pxrd_cls = self.encode(batch)
+        
+        # RAG: Prepare template embeddings if retriever is provided
+        template_emb = None
+        if retriever is not None:
+            import numpy as np
+            # Get PXRD embeddings for retrieval
+            pxrd_feat_np = pxrd_cls.cpu().numpy()  # [B, d]
+            
+            # Retrieve templates for each sample in batch
+            template_embs_list = []
+            for i in range(batch_size):
+                # Query retriever for top-M similar structures
+                results = retriever.query(pxrd_feat_np[i], top_m=rag_top_m)
+                # Average the retrieved crystal embeddings
+                avg_template = np.mean(results['h_crystal'], axis=0)  # [d]
+                template_embs_list.append(avg_template)
+            
+            # Stack and convert to tensor
+            template_emb = torch.from_numpy(np.stack(template_embs_list, axis=0)).float().to(self.device)  # [B, d]
+            print(f"RAG: Retrieved {rag_top_m} templates per sample, template_emb shape: {template_emb.shape}")
         for t in tqdm(range(time_start, 0, -1)):
 
             times = torch.full((batch_size, ), t, device = self.device)
@@ -251,7 +324,9 @@ class CSPDiffusion(BaseModule):
             step_size = step_lr * (sigma_x / self.sigma_scheduler.sigma_begin) ** 2
             std_x = torch.sqrt(2 * step_size)
 
-            pred_l, pred_x = self.decoder(time_emb, batch.atom_types, x_t, l_t, batch.num_atoms, batch.batch, pxrd_cls)
+            # RAG: Pass template_emb to decoder (scaled by rag_strength)
+            scaled_template_emb = template_emb * rag_strength if template_emb is not None else None
+            pred_l, pred_x = self.decoder(time_emb, batch.atom_types, x_t, l_t, batch.num_atoms, batch.batch, pxrd_cls, scaled_template_emb)
 
             pred_x = pred_x * torch.sqrt(sigma_norm)
 
@@ -268,7 +343,8 @@ class CSPDiffusion(BaseModule):
             step_size = (sigma_x ** 2 - adjacent_sigma_x ** 2)
             std_x = torch.sqrt((adjacent_sigma_x ** 2 * (sigma_x ** 2 - adjacent_sigma_x ** 2)) / (sigma_x ** 2))   
 
-            pred_l, pred_x = self.decoder(time_emb, batch.atom_types, x_t_minus_05, l_t_minus_05, batch.num_atoms, batch.batch, pxrd_cls)
+            # RAG: Pass template_emb to decoder (scaled by rag_strength)
+            pred_l, pred_x = self.decoder(time_emb, batch.atom_types, x_t_minus_05, l_t_minus_05, batch.num_atoms, batch.batch, pxrd_cls, scaled_template_emb)
 
             pred_x = pred_x * torch.sqrt(sigma_norm)
 
@@ -302,10 +378,61 @@ class CSPDiffusion(BaseModule):
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         batch = self.clip_batch(batch)
-        output_dict = self(batch)
         
-        log_dict, loss = self.compute_stats(output_dict, prefix='train')
+        # ALIGNMENT: Determine if we should compute alignment loss
+        use_alignment = (
+            self.use_alignment_loss and 
+            self.cpcp_model is not None and 
+            self.current_epoch >= self.alignment_start_epoch
+        )
+        
+        # Forward pass with optional hidden states
+        output_dict = self(batch, return_hidden=use_alignment)
+        
+        # Base diffusion loss
         loss = output_dict['loss']
+        log_dict, _ = self.compute_stats(output_dict, prefix='train')
+        
+        # ALIGNMENT: Add alignment loss if enabled
+        if use_alignment:
+            from xtalnet.losses import alignment_loss
+            
+            # Get crystal embeddings from CPCP
+            with torch.no_grad():
+                lattices = lattice_params_to_matrix_torch(batch.lengths, batch.angles)
+                crystal_emb = self.cpcp_model.crystal_encoder(
+                    batch.atom_types, 
+                    batch.frac_coords, 
+                    lattices, 
+                    batch.num_atoms, 
+                    batch.batch
+                )
+                crystal_emb = F.normalize(crystal_emb, dim=-1)
+            
+            # Compute alignment loss
+            hidden_list = output_dict['hidden_list']
+            loss_align = alignment_loss(
+                hidden_list, 
+                crystal_emb, 
+                temperature=self.alignment_temperature
+            )
+            
+            # Combine losses
+            total_loss = loss + self.alignment_lambda * loss_align
+            
+            # Log alignment loss
+            log_dict['train_loss_alignment'] = loss_align
+            log_dict['train_loss_total'] = total_loss
+            log_dict['train_alignment_lambda'] = self.alignment_lambda
+            
+            # Compute alignment metrics (for monitoring)
+            from xtalnet.losses.alignment import compute_alignment_metrics
+            with torch.no_grad():
+                metrics = compute_alignment_metrics(hidden_list, crystal_emb)
+                log_dict['train_align_cosine_sim'] = metrics['avg_cosine_sim']
+                log_dict['train_align_top1_acc'] = metrics['top1_accuracy']
+            
+            loss = total_loss
 
         self.log_dict(
             log_dict,
